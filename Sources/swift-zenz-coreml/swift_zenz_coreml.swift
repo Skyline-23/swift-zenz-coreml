@@ -11,6 +11,17 @@ func loadModel() -> zenz_v1? {
     return try? zenz_v1(configuration: config)
 }
 
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
+func loadStatefulModel() -> zenz_v1_cached? {
+    do {
+        let config = MLModelConfiguration()
+        return try zenz_v1_cached(configuration: config)
+    } catch let error {
+        print(error)
+        return nil
+    }
+}
+
 // Load the Tokenizer model
 func loadTokenizer() async -> Tokenizer? {
     guard let modelFolder = Bundle.module.resourceURL else {
@@ -24,43 +35,42 @@ func loadTokenizer() async -> Tokenizer? {
     }
 }
 
-// 예측 수행 함수
-// Perform prediction
-func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> [String] {
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
+func predictStateful(text: String, model: zenz_v1_cached, tokenizer: Tokenizer) -> [String] {
+    let state = model.makeState()
+    
     // 텍스트를 토크나이저를 사용하여 인코딩
     // Encode the input text using the tokenizer
     let inputIDs = tokenizer.encode(text: text)
     print("inputIDs", text, inputIDs)
-
+    
     // 입력을 위한 MLMultiArray 생성
     // Create MLMultiArray for input
     let inputArray = try? MLMultiArray(shape: [1, 16], dataType: .float32)
     for (index, token) in inputIDs.enumerated() {
         inputArray?[index] = NSNumber(value: token)
     }
-
+    
     // Attention mask 생성
     // Create attention mask
     let attentionMask = try? MLMultiArray(shape: [1, 16], dataType: .float32)
     for i in 0..<inputIDs.count {
         attentionMask?[i] = 1
     }
-
+    
     guard let inputArray, let attentionMask else { return [] }
     // 모델 입력 생성
     // Create model input
-    let input = zenz_v1Input(input_ids: inputArray, attention_mask: attentionMask)
-
-    // 예측 수행
-    // Perform prediction
-    let output = try? model.prediction(input: input)
-
+    let input = zenz_v1_cachedInput(input_ids: inputArray, attention_mask: attentionMask)
+    
+    let output = try? model.prediction(input_ids: inputArray, attention_mask: attentionMask, using: state)
+    
     // 출력 logits 디코딩
     // Decode the output logits
-    let logits = output?.linear_0
-
+    let logits = output?.output
+    
     guard let logits else { return [] }
-
+    
     // logits에서 예측된 토큰 ID 추출
     // Extract predicted token IDs from logits
     var predictedTokenIDs = [[Int]]()
@@ -75,12 +85,74 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> [String] {
             predictedTokenIDs[batchID].append(maxId)
         }
     }
-
+    
     // 예측된 토큰 ID를 다시 텍스트로 디코딩
     // Decode the predicted token IDs back to text
     print(predictedTokenIDs)
     let predictedTexts = predictedTokenIDs.map { tokenizer.decode(tokens: $0) }
+    
+    // 결과 출력
+    // Print the result
+    return predictedTexts
+}
 
+// 예측 수행 함수
+// Perform prediction
+func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> [String] {
+    // 텍스트를 토크나이저를 사용하여 인코딩
+    // Encode the input text using the tokenizer
+    let inputIDs = tokenizer.encode(text: text)
+    print("inputIDs", text, inputIDs)
+    
+    // 입력을 위한 MLMultiArray 생성
+    // Create MLMultiArray for input
+    let inputArray = try? MLMultiArray(shape: [1, 16], dataType: .float32)
+    for (index, token) in inputIDs.enumerated() {
+        inputArray?[index] = NSNumber(value: token)
+    }
+    
+    // Attention mask 생성
+    // Create attention mask
+    let attentionMask = try? MLMultiArray(shape: [1, 16], dataType: .float32)
+    for i in 0..<inputIDs.count {
+        attentionMask?[i] = 1
+    }
+    
+    guard let inputArray, let attentionMask else { return [] }
+    // 모델 입력 생성
+    // Create model input
+    let input = zenz_v1Input(input_ids: inputArray, attention_mask: attentionMask)
+    
+    // 예측 수행
+    // Perform prediction
+    let output = try? model.prediction(input: input)
+    
+    // 출력 logits 디코딩
+    // Decode the output logits
+    let logits = output?.linear_0
+    
+    guard let logits else { return [] }
+    
+    // logits에서 예측된 토큰 ID 추출
+    // Extract predicted token IDs from logits
+    var predictedTokenIDs = [[Int]]()
+    for batchID in 0..<logits.shape[0].intValue {
+        predictedTokenIDs.append([])
+        for i in 0..<logits.shape[1].intValue {
+            var logitValues = [Float]()
+            // get argMax
+            let maxId = (0..<6000).max {
+                logits[[batchID, i, $0] as [NSNumber]].floatValue < logits[[0, i, $1] as [NSNumber]].floatValue
+            } ?? 0
+            predictedTokenIDs[batchID].append(maxId)
+        }
+    }
+    
+    // 예측된 토큰 ID를 다시 텍스트로 디코딩
+    // Decode the predicted token IDs back to text
+    print(predictedTokenIDs)
+    let predictedTexts = predictedTokenIDs.map { tokenizer.decode(tokens: $0) }
+    
     // 결과 출력
     // Print the result
     return predictedTexts
@@ -94,36 +166,36 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> [Strin
     // Encode the input text using the tokenizer
     let inputIDs = tokenizer.encode(text: text)
     print("inputIDs", text, inputIDs)
-
+    
     // 입력을 위한 MLMultiArray 생성
     // Create MLMultiArray for input
     let inputArray = try? MLMultiArray(shape: [1, 16], dataType: .float32)
     for (index, token) in inputIDs.enumerated() {
         inputArray?[index] = NSNumber(value: token)
     }
-
+    
     // Attention mask 생성
     // Create attention mask
     let attentionMask = try? MLMultiArray(shape: [1, 16], dataType: .float32)
     for i in 0..<inputIDs.count {
         attentionMask?[i] = 1
     }
-
+    
     guard let inputArray, let attentionMask else { return [] }
     // 모델 입력 생성
     // Create model input
     let input = zenz_v1Input(input_ids: inputArray, attention_mask: attentionMask)
-
+    
     // 예측 수행
     // Perform prediction
     let output = try? await model.prediction(input: input)
-
+    
     // 출력 logits 디코딩
     // Decode the output logits
     let logits = output?.linear_0
-
+    
     guard let logits else { return [] }
-
+    
     // logits에서 예측된 토큰 ID 추출
     // Extract predicted token IDs from logits
     var predictedTokenIDs = [[Int]]()
@@ -138,12 +210,12 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> [Strin
             predictedTokenIDs[batchID].append(maxId)
         }
     }
-
+    
     // 예측된 토큰 ID를 다시 텍스트로 디코딩
     // Decode the predicted token IDs back to text
     print(predictedTokenIDs)
     let predictedTexts = predictedTokenIDs.map { tokenizer.decode(tokens: $0) }
-
+    
     // 결과 출력
     // Print the result
     return predictedTexts
@@ -164,21 +236,23 @@ func predictDispatch(text: String, model: zenz_v1, tokenizer: Tokenizer, qos: Di
 
 // Greedy search를 사용하여 예측 수행
 // Perform prediction using Greedy search
-func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> String {
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
+func greedyPredictStateful(text: String, model: zenz_v1_cached, tokenizer: Tokenizer) -> String {
+    let state = model.makeState()
     // 텍스트를 토크나이저를 사용하여 인코딩
     // Encode the input text using the tokenizer
     var inputIDs = tokenizer.encode(text: text)
     print("inputIDs", text, inputIDs)
-
+    
     // 최대 시퀀스 길이 설정
     // Set the maximum sequence length
     let maxSeqLength = 128
     let batchSize = 1
-
+    
     // 예측된 토큰 ID를 저장할 배열
     // Array to store predicted token IDs
     var predictedTokenIDs = inputIDs
-
+    
     while true {
         // 입력을 위한 MLMultiArray 생성
         // Create MLMultiArray for input
@@ -186,56 +260,135 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> String
         for (index, token) in predictedTokenIDs.enumerated() {
             inputArray?[index] = NSNumber(value: token)
         }
-
+        
         // Attention mask 생성
         // Create attention mask
         let attentionMask = try? MLMultiArray(shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)], dataType: .int32)
         for i in 0..<predictedTokenIDs.count {
             attentionMask?[i] = 1
         }
-
+        
         guard let inputArray, let attentionMask else { return "" }
-
+        
         // 모델 입력 생성
         // Create model input
-        let input = zenz_v1Input(input_ids: inputArray, attention_mask: attentionMask)
-
+        let input = zenz_v1_cachedInput(input_ids: inputArray, attention_mask: attentionMask)
+        
         // 예측 수행
         // Perform prediction
-        guard let output = try? model.prediction(input: input) else { return "" }
-
+        guard let output = try? model.prediction(input: input, using: state) else { return "" }
+        
         // 출력 logits 디코딩
         // Decode the output logits
-        let logits = output.linear_0
-
+        let logits = output.output
+        
         // logits에서 예측된 토큰 ID 추출
         // Extract predicted token ID from logits
         let nextTokenID = (0..<logits.shape[2].intValue).max {
             logits[[0, predictedTokenIDs.count - 1, $0] as [NSNumber]].floatValue <
                 logits[[0, predictedTokenIDs.count - 1, $1] as [NSNumber]].floatValue
         } ?? 0
-
+        
         // 종료 토큰 체크 (예: <EOS> 토큰 ID)
         // Check for end token (e.g., <EOS> token ID)
         if nextTokenID == 3 {
             break
         }
-
+        
         // 예측된 토큰 ID를 추가
         // Add the predicted token ID
         predictedTokenIDs.append(nextTokenID)
-
+        
         // 최대 시퀀스 길이에 도달하면 종료
         // Exit if the maximum sequence length is reached
         if predictedTokenIDs.count >= maxSeqLength {
             break
         }
     }
-
+    
     // 예측된 토큰 ID를 다시 텍스트로 디코딩
     // Decode the predicted token IDs back to text
     let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
+    
+    // 결과 출력
+    // Print the result
+    return predictedText
+}
 
+// Greedy search를 사용하여 예측 수행
+// Perform prediction using Greedy search
+func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> String {
+    // 텍스트를 토크나이저를 사용하여 인코딩
+    // Encode the input text using the tokenizer
+    var inputIDs = tokenizer.encode(text: text)
+    print("inputIDs", text, inputIDs)
+    
+    // 최대 시퀀스 길이 설정
+    // Set the maximum sequence length
+    let maxSeqLength = 128
+    let batchSize = 1
+    
+    // 예측된 토큰 ID를 저장할 배열
+    // Array to store predicted token IDs
+    var predictedTokenIDs = inputIDs
+    
+    while true {
+        // 입력을 위한 MLMultiArray 생성
+        // Create MLMultiArray for input
+        let inputArray = try? MLMultiArray(shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)], dataType: .int32)
+        for (index, token) in predictedTokenIDs.enumerated() {
+            inputArray?[index] = NSNumber(value: token)
+        }
+        
+        // Attention mask 생성
+        // Create attention mask
+        let attentionMask = try? MLMultiArray(shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)], dataType: .int32)
+        for i in 0..<predictedTokenIDs.count {
+            attentionMask?[i] = 1
+        }
+        
+        guard let inputArray, let attentionMask else { return "" }
+        
+        // 모델 입력 생성
+        // Create model input
+        let input = zenz_v1Input(input_ids: inputArray, attention_mask: attentionMask)
+        
+        // 예측 수행
+        // Perform prediction
+        guard let output = try? model.prediction(input: input) else { return "" }
+        
+        // 출력 logits 디코딩
+        // Decode the output logits
+        let logits = output.linear_0
+        
+        // logits에서 예측된 토큰 ID 추출
+        // Extract predicted token ID from logits
+        let nextTokenID = (0..<logits.shape[2].intValue).max {
+            logits[[0, predictedTokenIDs.count - 1, $0] as [NSNumber]].floatValue <
+                logits[[0, predictedTokenIDs.count - 1, $1] as [NSNumber]].floatValue
+        } ?? 0
+        
+        // 종료 토큰 체크 (예: <EOS> 토큰 ID)
+        // Check for end token (e.g., <EOS> token ID)
+        if nextTokenID == 3 {
+            break
+        }
+        
+        // 예측된 토큰 ID를 추가
+        // Add the predicted token ID
+        predictedTokenIDs.append(nextTokenID)
+        
+        // 최대 시퀀스 길이에 도달하면 종료
+        // Exit if the maximum sequence length is reached
+        if predictedTokenIDs.count >= maxSeqLength {
+            break
+        }
+    }
+    
+    // 예측된 토큰 ID를 다시 텍스트로 디코딩
+    // Decode the predicted token IDs back to text
+    let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
+    
     // 결과 출력
     // Print the result
     return predictedText
@@ -249,16 +402,16 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> 
     // Encode the input text using the tokenizer
     var inputIDs = tokenizer.encode(text: text)
     print("inputIDs", text, inputIDs)
-
+    
     // 최대 시퀀스 길이 설정
     // Set the maximum sequence length
     let maxSeqLength = 128
     let batchSize = 1
-
+    
     // 예측된 토큰 ID를 저장할 배열
     // Array to store predicted token IDs
     var predictedTokenIDs = inputIDs
-
+    
     while true {
         // 입력을 위한 MLMultiArray 생성
         // Create MLMultiArray for input
@@ -266,56 +419,56 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> 
         for (index, token) in predictedTokenIDs.enumerated() {
             inputArray?[index] = NSNumber(value: token)
         }
-
+        
         // Attention mask 생성
         // Create attention mask
         let attentionMask = try? MLMultiArray(shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)], dataType: .int32)
         for i in 0..<predictedTokenIDs.count {
             attentionMask?[i] = 1
         }
-
+        
         guard let inputArray, let attentionMask else { return "" }
-
+        
         // 모델 입력 생성
         // Create model input
         let input = zenz_v1Input(input_ids: inputArray, attention_mask: attentionMask)
-
+        
         // 예측 수행
         // Perform prediction
         guard let output = try? await model.prediction(input: input) else { return "" }
-
+        
         // 출력 logits 디코딩
         // Decode the output logits
         let logits = output.linear_0
-
+        
         // logits에서 예측된 토큰 ID 추출
         // Extract predicted token ID from logits
         let nextTokenID = (0..<logits.shape[2].intValue).max {
             logits[[0, predictedTokenIDs.count - 1, $0] as [NSNumber]].floatValue <
                 logits[[0, predictedTokenIDs.count - 1, $1] as [NSNumber]].floatValue
         } ?? 0
-
+        
         // 종료 토큰 체크 (예: <EOS> 토큰 ID)
         // Check for end token (e.g., <EOS> token ID)
         if nextTokenID == 3 {
             break
         }
-
+        
         // 예측된 토큰 ID를 추가
         // Add the predicted token ID
         predictedTokenIDs.append(nextTokenID)
-
+        
         // 최대 시퀀스 길이에 도달하면 종료
         // Exit if the maximum sequence length is reached
         if predictedTokenIDs.count >= maxSeqLength {
             break
         }
     }
-
+    
     // 예측된 토큰 ID를 다시 텍스트로 디코딩
     // Decode the predicted token IDs back to text
     let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
-
+    
     // 결과 출력
     // Print the result
     return predictedText
@@ -376,5 +529,24 @@ func main() async {
         let predictedSentence = greedyPredict(text: "\u{EE00}カンコクゴヲベンキョウスル\u{EE01}", model: model, tokenizer: tokenizer)
         print(predictedSentence)
         print("Main thread time:", Date().timeIntervalSince(start))
+    }
+    
+    if #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *) {
+        let statefulModel = loadStatefulModel()
+        
+        guard let statefulModel else { fatalError("Stateful model not found") }
+        
+        do {
+            let start = Date()
+            let predictedSentence = greedyPredictStateful(text: "\u{EE00}ニホンゴ\u{EE01}", model: statefulModel, tokenizer: tokenizer)
+            print(predictedSentence)
+            print("Stateful Main thread time:", Date().timeIntervalSince(start))
+        }
+        do {
+            let start = Date()
+            let predictedSentence = greedyPredictStateful(text: "\u{EE00}カンコクゴヲベンキョウスル\u{EE01}", model: statefulModel, tokenizer: tokenizer)
+            print(predictedSentence)
+            print("Stateful Main thread time:", Date().timeIntervalSince(start))
+        }
     }
 }
