@@ -310,7 +310,10 @@ func greedyPredictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tok
         }
         
         let logits = output.logits
-        let lastIndex = seqLen - 1
+        // KR: Python 쪽에서 [B, 1, V] 형태로 마지막 시점만 반환하므로, time 축은 항상 0입니다.
+        // JP: Python 側が [B, 1, V] で最後のタイムステップのみ返すため、time 軸は常に 0 です。
+        // EN: Python now returns only the last step as [B, 1, V], so the valid time index is always 0.
+        let lastIndex = logits.shape[1].intValue - 1
         let bestIDInt = argmaxLogitsRow(logits, batch: 0, time: lastIndex)
         let bestID = Int32(bestIDInt)
 
@@ -590,6 +593,35 @@ func main() async {
         let statefulModel = loadStatefulModel()
         
         guard let statefulModel else { fatalError("Stateful model not found") }
+        do {
+            // KR: Stateful 모델을 벤치마크 전에 한 번만 실행해서,
+            //     컴파일/플랜 빌드 시간을 측정에서 제외합니다.
+            // JP: ステートフルモデルをベンチマーク前に一度だけ実行し、
+            //     コンパイル/プラン構築時間を測定から除外します。
+            // EN: Run the stateful model once before benchmarking so that
+            //     compile/plan-build time is excluded from the timing.
+
+            if
+                let warmupInputIDs = try? MLMultiArray(shape: [1, 1], dataType: .int32),
+                let warmupMask = try? MLMultiArray(shape: [1, 1], dataType: .int32)
+            {
+                warmupInputIDs[0] = 0
+                warmupMask[0] = 1
+
+                let warmupInput = zenz_v1_statefulInput(
+                    input_ids: warmupInputIDs,
+                    attention_mask: warmupMask
+                )
+
+                // 이 prediction은 async 버전으로 잡혀 있어서 await 필요
+                _ = try? await statefulModel.prediction(
+                    input: warmupInput,
+                    using: statefulModel.makeState()
+                )
+            } else {
+                print("[Stateful Warmup] Skipped: failed to allocate MLMultiArray.")
+            }
+        }
         
         do {
             let start = Date()
