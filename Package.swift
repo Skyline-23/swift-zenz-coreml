@@ -20,7 +20,7 @@ let package = Package(
             targets: ["swift-zenz-coreml"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-transformers", branch: "0.1.8"),
+        .package(url: "https://github.com/huggingface/swift-transformers", branch: "1.1.2"),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
