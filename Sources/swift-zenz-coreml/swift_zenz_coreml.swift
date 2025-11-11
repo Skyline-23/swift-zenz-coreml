@@ -21,6 +21,9 @@ func loadModel() -> zenz_v1? {
 func loadStatefulModel() -> zenz_v1_stateful? {
     do {
         let config = MLModelConfiguration()
+        // KR: 상태를 가지는 Core ML 모델을 로드하고, CPU+GPU 둘 다 활용하도록 설정합니다.
+        // JP: ステートフルな Core ML モデルを読み込み、CPU と GPU の両方を使うように設定します。
+        // EN: Load the stateful Core ML model and configure it to use both CPU and GPU.
         config.computeUnits = .cpuAndGPU
         return try zenz_v1_stateful(configuration: config)
     } catch let error {
@@ -221,64 +224,127 @@ func predictDispatch(text: String, model: zenz_v1, tokenizer: Tokenizer, qos: Di
     }
 }
 
-// Greedy search를 사용하여 예측 수행
-// Perform prediction using Greedy search
+// KR: Stateful Core ML 모델과 KV 캐시를 사용해서 Greedy Search로 토큰을 한 단계씩 생성합니다.
+// JP: ステートフルな Core ML モデルと KV キャッシュを使い、Greedy サーチでトークンを一つずつ生成します。
+// EN: Perform greedy token-by-token generation using the stateful Core ML model and its KV cache.
 @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
 func greedyPredictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tokenizer) -> String {
     let state = model.makeState()
+    // KR: Core ML이 관리하는 state 객체로, keyCache / valueCache / pastLen을 포함합니다.
+    // JP: Core ML が管理する state オブジェクトで、keyCache / valueCache / pastLen を内部に持ちます。
+    // EN: Core ML-managed state object that internally holds keyCache / valueCache / pastLen.
     
-    var inputIDs = tokenizer.encode(text: text)
-    print("[Stateful Greedy] inputIDs:", text, inputIDs)
+    var generatedIDs = tokenizer.encode(text: text)
+    print("[Stateful Greedy] inputIDs:", text, generatedIDs)
     
-    let maxSeqLength = 128
     let batchSize = 1
-    var predictedTokenIDs = inputIDs
+    let maxSeqLength = 128
+    let eosTokenID: Int32 = 3  // 모델에 맞게 조정 필요
     
-    while true {
-        // 입력 / attention mask는 이미 Int32 잘 쓰고 있음
-        let inputArray = try? MLMultiArray(
-            shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)],
-            dataType: .int32
-        )
-        for (index, token) in predictedTokenIDs.enumerated() {
-            inputArray?[index] = NSNumber(value: token)
+    // KR: (1) 프롬프트 전체를 한 번 넣어서 KV 캐시를 초기화합니다.
+    // JP: (1) 入力プロンプト全体を一度通して、KV キャッシュを初期化します。
+    // EN: (1) Feed the whole prompt once to initialize the KV cache.
+    do {
+        let seqLen = generatedIDs.count
+        guard let inputArray = try? MLMultiArray(
+                  shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
+                  dataType: .int32
+              ),
+              let attentionMask = try? MLMultiArray(
+                  shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
+                  dataType: .int32
+              ) else {
+            return ""
         }
         
-        let attentionMask = try? MLMultiArray(
-            shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)],
-            dataType: .int32
-        )
-        for i in 0..<predictedTokenIDs.count {
-            attentionMask?[i] = 1
+        for (index, token) in generatedIDs.enumerated() {
+            inputArray[index] = NSNumber(value: token)
+            attentionMask[index] = 1
         }
-        
-        guard let inputArray, let attentionMask else { return "" }
         
         let input = zenz_v1_statefulInput(input_ids: inputArray, attention_mask: attentionMask)
+        guard let output = try? model.prediction(input: input, using: state) else {
+            return ""
+        }
         
-        guard let output = try? model.prediction(input: input, using: state) else { return "" }
-        
-        // logits로 변경
         let logits = output.logits
+        let lastIndex = seqLen - 1
+        let vocabSize = logits.shape[2].intValue
         
-        let nextTokenID = (0..<logits.shape[2].intValue).max {
-            logits[[0, predictedTokenIDs.count - 1, $0] as [NSNumber]].floatValue <
-            logits[[0, predictedTokenIDs.count - 1, $1] as [NSNumber]].floatValue
-        } ?? 0
+        var bestID: Int32 = 0
+        var bestScore: Float = -.infinity
         
-        if nextTokenID == 3 {
+        for v in 0..<vocabSize {
+            let score = logits[[0, lastIndex, v] as [NSNumber]].floatValue
+            if score > bestScore {
+                bestScore = score
+                bestID = Int32(v)
+            }
+        }
+        
+        generatedIDs.append(Int(bestID))
+        if bestID == eosTokenID {
+            return tokenizer.decode(tokens: generatedIDs)
+        }
+    }
+    
+    // (2) 증분 디코딩용 [1,1] 버퍼를 한 번만 생성하고 재사용
+    guard let stepInputArray = try? MLMultiArray(
+              shape: [NSNumber(value: batchSize), 1],
+              dataType: .int32
+          ),
+          let stepAttentionMask = try? MLMultiArray(
+              shape: [NSNumber(value: batchSize), 1],
+              dataType: .int32
+          ) else {
+        return ""
+    }
+    
+    // KR: 이후에는 마지막 토큰만 [1,1] 입력으로 넣어가며 한 토큰씩 greedy로 확장합니다.
+    // JP: 以降は最後のトークンだけを [1,1] 入力として与え、1 トークンずつ Greedy に生成を延長します。
+    // EN: After initialization, we only feed the last token as a [1,1] input and extend the sequence greedily one token at a time.
+    while generatedIDs.count < maxSeqLength {
+        guard let lastTokenInt = generatedIDs.last else {
             break
         }
         
-        predictedTokenIDs.append(nextTokenID)
+        let lastTokenID = Int32(lastTokenInt)
+        if lastTokenID == eosTokenID {
+            break
+        }
         
-        if predictedTokenIDs.count >= maxSeqLength {
+        // 여기서는 할당 없이 값만 덮어쓰기
+        stepInputArray[0] = NSNumber(value: lastTokenID)
+        stepAttentionMask[0] = 1
+        
+        let input = zenz_v1_statefulInput(input_ids: stepInputArray, attention_mask: stepAttentionMask)
+        guard let output = try? model.prediction(input: input, using: state) else {
+            break
+        }
+        
+        let logits = output.logits
+        let vocabSize = logits.shape[2].intValue
+        
+        var bestID: Int32 = 0
+        var bestScore: Float = -.infinity
+        
+        for v in 0..<vocabSize {
+            let score = logits[[0, 0, v] as [NSNumber]].floatValue
+            if score > bestScore {
+                bestScore = score
+                bestID = Int32(v)
+            }
+        }
+        
+        generatedIDs.append(Int(bestID))
+        if bestID == eosTokenID {
             break
         }
     }
     
-    let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
-    return predictedText
+    let predictedText = tokenizer.decode(tokens: generatedIDs)
+    let cleanedText = predictedText.replacingOccurrences(of: "[PAD]", with: "")
+    return cleanedText
 }
 
 // Greedy search를 사용하여 예측 수행
