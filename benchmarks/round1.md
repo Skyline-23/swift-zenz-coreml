@@ -1,9 +1,9 @@
-# 1회차 벤치마크 결과 (Round 1)
+# 第1回 ベンチマーク結果 / 1회차 벤치마크 결과 / Round 1 Benchmark Results
 
 `swift-zenz-coremlTests`를 실행하여 zenz-v1 Core ML 모델의 한 스텝(greedy 디코딩 1회) 호출 시간을 측정한 결과입니다.  
 각 문장은 Stateful / Stateless × Sync / Async 조합으로 디코딩되었으며, 평균 및 프롬프트별 상세 결과를 포함합니다.
 
-## 전체 평균
+## 全体平均 / 전체 평균 / Overall Average
 
 | Strategy | Avg latency (s) |
 |----------|-----------------:|
@@ -12,9 +12,9 @@
 | Stateless / Async global | 0.168 |
 | Stateless / Sync main | 0.157 |
 
-## 문장 길이별 평균
+## 文の長さ別平均 / 문장 길이별 평균 / Average by Sentence Length
 
-**짧은 입력 (≤ 25 tokens)**  
+**短い入力 (≤ 25 tokens) / 짧은 입력 (≤ 25 tokens) / Short Inputs (≤ 25 tokens)**  
 | Strategy | Avg latency (s) |
 |----------|-----------------:|
 | Stateful / Async global | 0.092 |
@@ -22,7 +22,7 @@
 | Stateless / Async global | 0.097 |
 | Stateless / Sync main | 0.090 |
 
-**긴 입력 (> 25 tokens)**  
+**長い入力 (> 25 tokens) / 긴 입력 (> 25 tokens) / Long Inputs (> 25 tokens)**  
 | Strategy | Avg latency (s) |
 |----------|-----------------:|
 | Stateful / Async global | 0.238 |
@@ -30,7 +30,7 @@
 | Stateless / Async global | 0.241 |
 | Stateless / Sync main | 0.235 |
 
-## 프롬프트별 상세 결과
+## プロンプト別詳細結果 / 프롬프트별 상세 결과 / Detailed Results by Prompt
 
 | Prompt | Input (Kana) | Stateful Output / Sync (s) | Stateful Output / Async (s) | Stateless Output / Sync (s) | Stateless Output / Async (s) |
 |--------|---------------|-----------------------------|-----------------------------|-----------------------------|-----------------------------|
