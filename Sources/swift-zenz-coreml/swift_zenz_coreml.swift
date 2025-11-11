@@ -10,6 +10,59 @@ struct BenchmarkResult {
     let duration: TimeInterval
 }
 
+// KR: logits[batch, time, vocab] 한 줄에서 argmax를 빠르게 계산하는 공용 유틸리티.
+// JP: logits[batch, time, vocab] の 1 行に対して高速に argmax を計算するユーティリティ。
+// EN: Shared utility to efficiently compute argmax over logits[batch, time, vocab] for a single time step.
+func argmaxLogitsRow(_ logits: MLMultiArray, batch: Int, time: Int) -> Int {
+    let vocabSize = logits.shape[2].intValue
+    let seqLen = logits.shape[1].intValue
+
+    switch logits.dataType {
+    case .float32:
+        // KR: Float32 기반 MLMultiArray를 직접 포인터로 읽어 argmax를 계산합니다.
+        // JP: Float32 ベースの MLMultiArray をポインタ経由で読み取り、argmax を計算します。
+        // EN: Read Float32-based MLMultiArray via a raw pointer and compute argmax.
+        let ptr = UnsafeMutablePointer<Float>(OpaquePointer(logits.dataPointer))
+        let base = (batch * seqLen + time) * vocabSize
+        var bestId = 0
+        var bestScore = -Float.infinity
+        for v in 0..<vocabSize {
+            let score = ptr[base + v]
+            if score > bestScore {
+                bestScore = score
+                bestId = v
+            }
+        }
+        return bestId
+
+    case .float16:
+        // KR: Float16 기반 MLMultiArray를 직접 포인터로 읽어 argmax를 계산합니다.
+        // JP: Float16 ベースの MLMultiArray をポインタ経由で読み取り、argmax を計算します。
+        // EN: Read Float16-based MLMultiArray via a raw pointer and compute argmax.
+        let ptr = UnsafeMutablePointer<Float16>(OpaquePointer(logits.dataPointer))
+        let base = (batch * seqLen + time) * vocabSize
+        var bestId = 0
+        var bestScore = -Float.infinity
+        for v in 0..<vocabSize {
+            let score = Float(ptr[base + v])
+            if score > bestScore {
+                bestScore = score
+                bestId = v
+            }
+        }
+        return bestId
+
+    default:
+        // KR: 지원하지 않는 타입인 경우, 기존의 느린 인덱싱 방식으로 되돌아갑니다.
+        // JP: サポートしていない型の場合は、従来の遅いインデックス方式にフォールバックします。
+        // EN: For unsupported dtypes, fall back to the original, slower indexing-based argmax.
+        return (0..<vocabSize).max {
+            logits[[batch, time, $0] as [NSNumber]].floatValue <
+            logits[[batch, time, $1] as [NSNumber]].floatValue
+        } ?? 0
+    }
+}
+
 // CoreML 모델 로드 함수
 // Load the CoreML model
 func loadModel() -> zenz_v1? {
@@ -87,10 +140,7 @@ func predictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tokenizer
     for batchID in 0..<logits.shape[0].intValue {
         predictedTokenIDs.append([])
         for i in 0..<logits.shape[1].intValue {
-            let maxId = (0..<6000).max {
-                logits[[batchID, i, $0] as [NSNumber]].floatValue <
-                logits[[0, i, $1] as [NSNumber]].floatValue
-            } ?? 0
+            let maxId = argmaxLogitsRow(logits, batch: batchID, time: i)
             predictedTokenIDs[batchID].append(maxId)
         }
     }
@@ -136,11 +186,7 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> [String] {
     for batchID in 0..<logits.shape[0].intValue {
         predictedTokenIDs.append([])
         for i in 0..<logits.shape[1].intValue {
-            var logitValues = [Float]()
-            // get argMax
-            let maxId = (0..<6000).max {
-                logits[[batchID, i, $0] as [NSNumber]].floatValue < logits[[0, i, $1] as [NSNumber]].floatValue
-            } ?? 0
+            let maxId = argmaxLogitsRow(logits, batch: batchID, time: i)
             predictedTokenIDs[batchID].append(maxId)
         }
     }
@@ -192,11 +238,7 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> [Strin
     for batchID in 0..<logits.shape[0].intValue {
         predictedTokenIDs.append([])
         for i in 0..<logits.shape[1].intValue {
-            var logitValues = [Float]()
-            // get argMax
-            let maxId = (0..<6000).max {
-                logits[[batchID, i, $0] as [NSNumber]].floatValue < logits[[0, i, $1] as [NSNumber]].floatValue
-            } ?? 0
+            let maxId = argmaxLogitsRow(logits, batch: batchID, time: i)
             predictedTokenIDs[batchID].append(maxId)
         }
     }
@@ -269,19 +311,9 @@ func greedyPredictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tok
         
         let logits = output.logits
         let lastIndex = seqLen - 1
-        let vocabSize = logits.shape[2].intValue
-        
-        var bestID: Int32 = 0
-        var bestScore: Float = -.infinity
-        
-        for v in 0..<vocabSize {
-            let score = logits[[0, lastIndex, v] as [NSNumber]].floatValue
-            if score > bestScore {
-                bestScore = score
-                bestID = Int32(v)
-            }
-        }
-        
+        let bestIDInt = argmaxLogitsRow(logits, batch: 0, time: lastIndex)
+        let bestID = Int32(bestIDInt)
+
         generatedIDs.append(Int(bestID))
         if bestID == eosTokenID {
             return tokenizer.decode(tokens: generatedIDs)
@@ -323,19 +355,9 @@ func greedyPredictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tok
         }
         
         let logits = output.logits
-        let vocabSize = logits.shape[2].intValue
-        
-        var bestID: Int32 = 0
-        var bestScore: Float = -.infinity
-        
-        for v in 0..<vocabSize {
-            let score = logits[[0, 0, v] as [NSNumber]].floatValue
-            if score > bestScore {
-                bestScore = score
-                bestID = Int32(v)
-            }
-        }
-        
+        let bestIDInt = argmaxLogitsRow(logits, batch: 0, time: 0)
+        let bestID = Int32(bestIDInt)
+
         generatedIDs.append(Int(bestID))
         if bestID == eosTokenID {
             break
@@ -388,10 +410,11 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> String
         
         // logits에서 예측된 토큰 ID 추출
         // Extract predicted token ID from logits
-        let nextTokenID = (0..<logits.shape[2].intValue).max {
-            logits[[0, predictedTokenIDs.count - 1, $0] as [NSNumber]].floatValue <
-                logits[[0, predictedTokenIDs.count - 1, $1] as [NSNumber]].floatValue
-        } ?? 0
+        let nextTokenID = argmaxLogitsRow(
+            logits,
+            batch: 0,
+            time: predictedTokenIDs.count - 1
+        )
         
         // 종료 토큰 체크 (예: <EOS> 토큰 ID)
         // Check for end token (e.g., <EOS> token ID)
@@ -461,10 +484,11 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> 
         
         // logits에서 예측된 토큰 ID 추출
         // Extract predicted token ID from logits
-        let nextTokenID = (0..<logits.shape[2].intValue).max {
-            logits[[0, predictedTokenIDs.count - 1, $0] as [NSNumber]].floatValue <
-                logits[[0, predictedTokenIDs.count - 1, $1] as [NSNumber]].floatValue
-        } ?? 0
+        let nextTokenID = argmaxLogitsRow(
+            logits,
+            batch: 0,
+            time: predictedTokenIDs.count - 1
+        )
         
         // 종료 토큰 체크 (예: <EOS> 토큰 ID)
         // Check for end token (e.g., <EOS> token ID)
