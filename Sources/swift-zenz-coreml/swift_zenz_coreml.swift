@@ -8,22 +8,60 @@ import Foundation
 struct BenchmarkResult {
     let label: String
     let duration: TimeInterval
+    let input: String
+    let output: String
 }
 
-// KR: logits[batch, time, vocab] 한 줄에서 argmax를 빠르게 계산하는 공용 유틸리티.
-// JP: logits[batch, time, vocab] の 1 行に対して高速に argmax を計算するユーティリティ。
-// EN: Shared utility to efficiently compute argmax over logits[batch, time, vocab] for a single time step.
+// Helper to control verbosity of generation logs.
+// 생성 과정에서 너무 많은 로그가 찍히지 않도록 제어하기 위한 헬퍼.
+// 生成処理でログが出過ぎないように制御するヘルパー。
+enum GenerationLogConfig {
+    static var enableVerbose: Bool = false
+}
+
+func generationLog(_ message: @autoclosure () -> String) {
+    guard GenerationLogConfig.enableVerbose else { return }
+    print(message())
+}
+// Helper to group and sort benchmark results for a single sentence.
+// 동일 문장에 대한 벤치마크 결과만 묶어서 정렬/출력하는 헬퍼.
+// 同じ文に対するベンチマーク結果だけをまとめてソートして出力するヘルパー。
+func printBenchmarkRanking(for groupTag: String, benchmarks: [BenchmarkResult]) {
+    let filtered = benchmarks.filter { $0.label.contains(groupTag) }
+    guard !filtered.isEmpty else { return }
+    print("===== Benchmark Ranking for \(groupTag) (fast → slow) =====")
+    for (index, result) in filtered.sorted(by: { $0.duration < $1.duration }).enumerated() {
+        print("\(index + 1). \(result.label): \(result.duration) s \(result.input), \(result.output)")
+    }
+}
+
+// Shared utility to efficiently compute argmax over logits[batch, time, vocab] for a single time step.
+// logits[batch, time, vocab] 한 줄에서 argmax를 빠르게 계산하는 공용 유틸리티.
+// logits[batch, time, vocab] の 1 行に対して高速に argmax を計算するユーティリティ。
 func argmaxLogitsRow(_ logits: MLMultiArray, batch: Int, time: Int) -> Int {
-    let vocabSize = logits.shape[2].intValue
+    let batchSize = logits.shape[0].intValue
     let seqLen = logits.shape[1].intValue
+    let vocabSize = logits.shape[2].intValue
+
+    // 1) batch / time 기본 범위 체크
+    guard batch >= 0, batch < batchSize, time >= 0, time < seqLen else {
+        print("[argmaxLogitsRow] Invalid indices: batch=\(batch), time=\(time), shape=\(logits.shape)")
+        return 0
+    }
+
+    let base = (batch * seqLen + time) * vocabSize
+    let totalCount = logits.count
+
+    // 2) 전체 버퍼 크기 기준으로도 한 번 더 체크
+    guard base >= 0, base + vocabSize <= totalCount else {
+        print("[argmaxLogitsRow] Out-of-bounds: base=\(base), vocabSize=\(vocabSize), totalCount=\(totalCount)")
+        return 0
+    }
 
     switch logits.dataType {
     case .float32:
-        // KR: Float32 기반 MLMultiArray를 직접 포인터로 읽어 argmax를 계산합니다.
-        // JP: Float32 ベースの MLMultiArray をポインタ経由で読み取り、argmax を計算します。
-        // EN: Read Float32-based MLMultiArray via a raw pointer and compute argmax.
-        let ptr = UnsafeMutablePointer<Float>(OpaquePointer(logits.dataPointer))
-        let base = (batch * seqLen + time) * vocabSize
+        // Float32 포인터로 안전하게 캐스팅
+        let ptr = logits.dataPointer.assumingMemoryBound(to: Float.self)
         var bestId = 0
         var bestScore = -Float.infinity
         for v in 0..<vocabSize {
@@ -36,11 +74,8 @@ func argmaxLogitsRow(_ logits: MLMultiArray, batch: Int, time: Int) -> Int {
         return bestId
 
     case .float16:
-        // KR: Float16 기반 MLMultiArray를 직접 포인터로 읽어 argmax를 계산합니다.
-        // JP: Float16 ベースの MLMultiArray をポインタ経由で読み取り、argmax を計算します。
-        // EN: Read Float16-based MLMultiArray via a raw pointer and compute argmax.
-        let ptr = UnsafeMutablePointer<Float16>(OpaquePointer(logits.dataPointer))
-        let base = (batch * seqLen + time) * vocabSize
+        // Float16 포인터로 안전하게 캐스팅
+        let ptr = logits.dataPointer.assumingMemoryBound(to: Float16.self)
         var bestId = 0
         var bestScore = -Float.infinity
         for v in 0..<vocabSize {
@@ -53,9 +88,7 @@ func argmaxLogitsRow(_ logits: MLMultiArray, batch: Int, time: Int) -> Int {
         return bestId
 
     default:
-        // KR: 지원하지 않는 타입인 경우, 기존의 느린 인덱싱 방식으로 되돌아갑니다.
-        // JP: サポートしていない型の場合は、従来の遅いインデックス方式にフォールバックします。
-        // EN: For unsupported dtypes, fall back to the original, slower indexing-based argmax.
+        // 지원하지 않는 타입이면 기존 안전하지만 느린 방식으로
         return (0..<vocabSize).max {
             logits[[batch, time, $0] as [NSNumber]].floatValue <
             logits[[batch, time, $1] as [NSNumber]].floatValue
@@ -63,8 +96,9 @@ func argmaxLogitsRow(_ logits: MLMultiArray, batch: Int, time: Int) -> Int {
     }
 }
 
-// CoreML 모델 로드 함수
-// Load the CoreML model
+// Load the CoreML model.
+// CoreML 모델을 로드합니다.
+// CoreMLモデルをロードします。
 func loadModel() -> zenz_v1? {
     let config = MLModelConfiguration()
     return try? zenz_v1(configuration: config)
@@ -74,9 +108,9 @@ func loadModel() -> zenz_v1? {
 func loadStatefulModel() -> zenz_v1_stateful? {
     do {
         let config = MLModelConfiguration()
-        // KR: 상태를 가지는 Core ML 모델을 로드하고, CPU+GPU 둘 다 활용하도록 설정합니다.
-        // JP: ステートフルな Core ML モデルを読み込み、CPU と GPU の両方を使うように設定します。
-        // EN: Load the stateful Core ML model and configure it to use both CPU and GPU.
+        // Load the stateful Core ML model and configure it to use both CPU and GPU.
+        // 상태를 가지는 Core ML 모델을 로드하고, CPU+GPU 둘 다 활용하도록 설정합니다.
+        // ステートフルな Core ML モデルを読み込み、CPU と GPU の両方を使うように設定します。
         config.computeUnits = .cpuAndGPU
         return try zenz_v1_stateful(configuration: config)
     } catch let error {
@@ -85,7 +119,9 @@ func loadStatefulModel() -> zenz_v1_stateful? {
     }
 }
 
-// Load the Tokenizer model
+// Load the Tokenizer model.
+// 토크나이저 모델을 로드합니다.
+// トークナイザーモデルをロードします。
 func loadTokenizer() async -> Tokenizer? {
     guard let modelFolder = Bundle.module.resourceURL else {
         print("Model Folder was not found")
@@ -102,36 +138,47 @@ func loadTokenizer() async -> Tokenizer? {
 func predictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tokenizer) -> [String] {
     let state = model.makeState()
     
-    // 텍스트를 토크나이저를 사용하여 인코딩
-    // Encode the input text using the tokenizer
+    // Encode the input text using the tokenizer.
+    // 텍스트를 토크나이저를 사용하여 인코딩합니다.
+    // トークナイザーを使って入力テキストをエンコードします。
     let inputIDs = tokenizer.encode(text: text)
-    print("[Stateful Predict] inputIDs:", text, inputIDs)
+    generationLog("[Stateful Predict] inputIDs: \(text) \(inputIDs)")
     
-    // 입력을 위한 MLMultiArray 생성 (Int32)
-    // Create MLMultiArray for input (Int32)
-    let inputArray = try? MLMultiArray(shape: [1, 16], dataType: .int32)
+    // Create MLMultiArray for input (Int32).
+    // 입력을 위한 MLMultiArray를 생성합니다 (Int32).
+    // 入力用のMLMultiArrayを作成します（Int32）。
+    let seqLen = inputIDs.count
+    guard
+        let inputArray = try? MLMultiArray(
+            shape: [NSNumber(value: 1), NSNumber(value: seqLen)],
+            dataType: .int32
+        ),
+        let attentionMask = try? MLMultiArray(
+            shape: [NSNumber(value: 1), NSNumber(value: seqLen)],
+            dataType: .int32
+        )
+    else {
+        return []
+    }
+    
     for (index, token) in inputIDs.enumerated() {
-        inputArray?[index] = NSNumber(value: token)
+        inputArray[index] = NSNumber(value: token)
+        attentionMask[index] = 1
     }
     
-    // Attention mask 생성 (Int32, 1/0)
-    // Create attention mask (Int32, 1/0)
-    let attentionMask = try? MLMultiArray(shape: [1, 16], dataType: .int32)
-    for i in 0..<inputIDs.count {
-        attentionMask?[i] = 1
-    }
-    
-    guard let inputArray, let attentionMask else { return [] }
-    
-    // Core ML stateful 입력 타입 사용
-    // Use Core ML stateful input type
+    // Use Core ML stateful input type.
+    // Core ML stateful 입력 타입을 사용합니다.
+    // Core MLのステートフル入力タイプを使用します。
     let input = zenz_v1_statefulInput(input_ids: inputArray, attention_mask: attentionMask)
     
-    // stateful prediction
+    // Perform stateful prediction.
+    // 상태를 가지는 예측을 수행합니다.
+    // ステートフルな予測を行います。
     let output = try? model.prediction(input: input, using: state)
     
-    // 출력 logits 디코딩 (output → logits)
-    // Decode logits (output → logits)
+    // Decode logits (output → logits).
+    // 출력 logits을 디코딩합니다 (output → logits).
+    // 出力logitsをデコードします（output → logits）。
     let logits = output?.logits
     
     guard let logits else { return [] }
@@ -145,43 +192,50 @@ func predictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tokenizer
         }
     }
     
-    print(predictedTokenIDs)
+    generationLog("predictedTokenIDs: \(predictedTokenIDs)")
     let predictedTexts = predictedTokenIDs.map { tokenizer.decode(tokens: $0) }
     return predictedTexts
 }
 
-// 예측 수행 함수
-// Perform prediction
+// Perform prediction.
+// 예측을 수행합니다.
+// 予測を行います。
 func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> [String] {
-    // 텍스트를 토크나이저를 사용하여 인코딩
-    // Encode the input text using the tokenizer
+    // Encode the input text using the tokenizer.
+    // 텍스트를 토크나이저를 사용하여 인코딩합니다.
+    // トークナイザーを使って入力テキストをエンコードします。
     let inputIDs = tokenizer.encode(text: text)
-    print("[Stateless Predict][Sync] inputIDs:", text, inputIDs)
+    generationLog("[Stateless Predict][Sync] inputIDs: \(text) \(inputIDs)")
     
-    // 입력을 위한 MLMultiArray 생성
-    // Create MLMultiArray for input
+    // Create MLMultiArray for input.
+    // 입력을 위한 MLMultiArray를 생성합니다.
+    // 入力用のMLMultiArrayを作成します。
     let inputArray = try? MLMultiArray(shape: [1, 16], dataType: .float32)
     for (index, token) in inputIDs.enumerated() {
         inputArray?[index] = NSNumber(value: token)
     }
     
     guard let inputArray else { return [] }
-    // 모델 입력 생성 (attention_mask 없이 input_ids만 전달)
-    // Create model input (only input_ids, no attention_mask)
+    // Create model input (only input_ids, no attention_mask).
+    // 모델 입력을 생성합니다 (attention_mask 없이 input_ids만 전달).
+    // モデル入力を作成します（attention_maskなしでinput_idsのみ渡します）。
     let input = zenz_v1Input(input_ids: inputArray)
     
-    // 예측 수행
-    // Perform prediction
+    // Perform prediction.
+    // 예측을 수행합니다.
+    // 予測を行います。
     let output = try? model.prediction(input: input)
     
-    // 출력 logits 디코딩
-    // Decode the output logits
+    // Decode the output logits.
+    // 출력 logits을 디코딩합니다.
+    // 出力logitsをデコードします。
     let logits = output?.logits
     
     guard let logits else { return [] }
     
-    // logits에서 예측된 토큰 ID 추출
-    // Extract predicted token IDs from logits
+    // Extract predicted token IDs from logits.
+    // logits에서 예측된 토큰 ID를 추출합니다.
+    // logitsから予測されたトークンIDを抽出します。
     var predictedTokenIDs = [[Int]]()
     for batchID in 0..<logits.shape[0].intValue {
         predictedTokenIDs.append([])
@@ -191,49 +245,58 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> [String] {
         }
     }
     
-    // 예측된 토큰 ID를 다시 텍스트로 디코딩
-    // Decode the predicted token IDs back to text
-    print(predictedTokenIDs)
+    // Decode the predicted token IDs back to text.
+    // 예측된 토큰 ID를 다시 텍스트로 디코딩합니다.
+    // 予測されたトークンIDをテキストにデコードします。
+    generationLog("predictedTokenIDs (sync predict): \(predictedTokenIDs)")
     let predictedTexts = predictedTokenIDs.map { tokenizer.decode(tokens: $0) }
     
-    // 결과 출력
-    // Print the result
+    // Print the result.
+    // 결과를 출력합니다.
+    // 結果を出力します。
     return predictedTexts
 }
 
-// 예측 수행 함수
-// Perform prediction
+// Perform prediction.
+// 예측을 수행합니다.
+// 予測を行います。
 @available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *)
 func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> [String] {
-    // 텍스트를 토크나이저를 사용하여 인코딩
-    // Encode the input text using the tokenizer
+    // Encode the input text using the tokenizer.
+    // 텍스트를 토크나이저를 사용하여 인코딩합니다.
+    // トークナイザーを使って入力テキストをエンコードします。
     let inputIDs = tokenizer.encode(text: text)
-    print("[Stateless Predict][Async] inputIDs:", text, inputIDs)
+    generationLog("[Stateless Predict][Async] inputIDs: \(text) \(inputIDs)")
     
-    // 입력을 위한 MLMultiArray 생성
-    // Create MLMultiArray for input
+    // Create MLMultiArray for input.
+    // 입력을 위한 MLMultiArray를 생성합니다.
+    // 入力用のMLMultiArrayを作成します。
     let inputArray = try? MLMultiArray(shape: [1, 16], dataType: .float32)
     for (index, token) in inputIDs.enumerated() {
         inputArray?[index] = NSNumber(value: token)
     }
     
     guard let inputArray else { return [] }
-    // 모델 입력 생성 (attention_mask 없이 input_ids만 전달)
-    // Create model input (only input_ids, no attention_mask)
+    // Create model input (only input_ids, no attention_mask).
+    // 모델 입력을 생성합니다 (attention_mask 없이 input_ids만 전달).
+    // モデル入力を作成します（attention_maskなしでinput_idsのみ渡します）。
     let input = zenz_v1Input(input_ids: inputArray)
     
-    // 예측 수행
-    // Perform prediction
+    // Perform prediction.
+    // 예측을 수행합니다.
+    // 予測を行います。
     let output = try? await model.prediction(input: input)
     
-    // 출력 logits 디코딩
-    // Decode the output logits
+    // Decode the output logits.
+    // 출력 logits을 디코딩합니다.
+    // 出力logitsをデコードします。
     let logits = output?.logits
     
     guard let logits else { return [] }
     
-    // logits에서 예측된 토큰 ID 추출
-    // Extract predicted token IDs from logits
+    // Extract predicted token IDs from logits.
+    // logits에서 예측된 토큰 ID를 추출합니다.
+    // logitsから予測されたトークンIDを抽出します。
     var predictedTokenIDs = [[Int]]()
     for batchID in 0..<logits.shape[0].intValue {
         predictedTokenIDs.append([])
@@ -243,13 +306,15 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> [Strin
         }
     }
     
-    // 예측된 토큰 ID를 다시 텍스트로 디코딩
-    // Decode the predicted token IDs back to text
-    print(predictedTokenIDs)
+    // Decode the predicted token IDs back to text.
+    // 예측된 토큰 ID를 다시 텍스트로 디코딩합니다.
+    // 予測されたトークンIDをテキストにデコードします。
+    generationLog("predictedTokenIDs (async predict): \(predictedTokenIDs)")
     let predictedTexts = predictedTokenIDs.map { tokenizer.decode(tokens: $0) }
     
-    // 결과 출력
-    // Print the result
+    // Print the result.
+    // 결과를 출력합니다.
+    // 結果を出力します。
     return predictedTexts
 }
 
@@ -258,140 +323,168 @@ func predict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> [Strin
 @available(tvOS, deprecated: 16.0, message: "Use newer API predict(text:model:tokenizer) async")
 @available(watchOS, deprecated: 9.0, message: "Use newer API predict(text:model:tokenizer) async")
 func predictDispatch(text: String, model: zenz_v1, tokenizer: Tokenizer, qos: DispatchQoS) async -> [String] {
+    // Avoid capturing non-Sendable CoreML model/tokenizer directly in the @Sendable continuation
+    let modelPtr = Unmanaged.passUnretained(model).toOpaque()
+
+    // Tokenizer는 프로토콜(existential)이라서 바로 Unmanaged에 못 넣으니 AnyObject로 올려 태운다
+    let tokenizerObject = tokenizer as AnyObject
+    let tokenizerPtr = Unmanaged.passUnretained(tokenizerObject).toOpaque()
+
     return await withCheckedContinuation { continuation in
         DispatchQueue.global(qos: qos.qosClass).async {
+            // Reconstruct references inside the non-@Sendable Dispatch closure
+            let model = Unmanaged<zenz_v1>.fromOpaque(modelPtr).takeUnretainedValue()
+            let tokenizerObject = Unmanaged<AnyObject>.fromOpaque(tokenizerPtr).takeUnretainedValue()
+            guard let tokenizer = tokenizerObject as? Tokenizer else {
+                fatalError("Stored tokenizer does not conform to Tokenizer")
+            }
+
             let result = predict(text: text, model: model, tokenizer: tokenizer)
             continuation.resume(returning: result)
         }
     }
 }
 
-// KR: Stateful Core ML 모델과 KV 캐시를 사용해서 Greedy Search로 토큰을 한 단계씩 생성합니다.
-// JP: ステートフルな Core ML モデルと KV キャッシュを使い、Greedy サーチでトークンを一つずつ生成します。
-// EN: Perform greedy token-by-token generation using the stateful Core ML model and its KV cache.
+// Perform greedy token-by-token generation using the stateful Core ML model and its KV cache.
+// Stateful Core ML 모델과 KV 캐시를 사용해서 Greedy Search로 토큰을 한 단계씩 생성합니다.
+// ステートフルな Core ML モデルと KV キャッシュを使い、Greedy サーチでトークンを一つずつ生成します。
 @available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
 func greedyPredictStateful(text: String, model: zenz_v1_stateful, tokenizer: Tokenizer) -> String {
     let state = model.makeState()
-    // KR: Core ML이 관리하는 state 객체로, keyCache / valueCache / pastLen을 포함합니다.
-    // JP: Core ML が管理する state オブジェクトで、keyCache / valueCache / pastLen を内部に持ちます。
-    // EN: Core ML-managed state object that internally holds keyCache / valueCache / pastLen.
-    
-    var generatedIDs = tokenizer.encode(text: text)
-    print("[Stateful Greedy] inputIDs:", text, generatedIDs)
-    
+    var predictedTokenIDs = tokenizer.encode(text: text)
+    generationLog("[Stateful Greedy] inputIDs: \(text) \(predictedTokenIDs)")
+
     let batchSize = 1
     let maxSeqLength = 128
-    let eosTokenID: Int32 = 3  // 모델에 맞게 조정 필요
-    
-    // KR: (1) 프롬프트 전체를 한 번 넣어서 KV 캐시를 초기화합니다.
-    // JP: (1) 入力プロンプト全体を一度通して、KV キャッシュを初期化します。
-    // EN: (1) Feed the whole prompt once to initialize the KV cache.
-    do {
-        let seqLen = generatedIDs.count
-        guard let inputArray = try? MLMultiArray(
-                  shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
-                  dataType: .int32
-              ),
-              let attentionMask = try? MLMultiArray(
-                  shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
-                  dataType: .int32
-              ) else {
-            return ""
+    let eosTokenID: Int32 = 3
+
+    while predictedTokenIDs.count < maxSeqLength {
+        let seqLen = predictedTokenIDs.count
+
+        guard
+            let inputArray = try? MLMultiArray(
+                shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
+                dataType: .int32
+            ),
+            let attentionMask = try? MLMultiArray(
+                shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
+                dataType: .int32
+            )
+        else {
+            print("[Stateful Greedy] Failed to allocate MLMultiArray")
+            break
         }
-        
-        for (index, token) in generatedIDs.enumerated() {
+
+        for (index, token) in predictedTokenIDs.enumerated() {
             inputArray[index] = NSNumber(value: token)
             attentionMask[index] = 1
         }
-        
+
         let input = zenz_v1_statefulInput(input_ids: inputArray, attention_mask: attentionMask)
         guard let output = try? model.prediction(input: input, using: state) else {
-            return ""
+            print("[Stateful Greedy] Prediction failed")
+            break
         }
-        
-        let logits = output.logits
-        // KR: Python 쪽에서 [B, 1, V] 형태로 마지막 시점만 반환하므로, time 축은 항상 0입니다.
-        // JP: Python 側が [B, 1, V] で最後のタイムステップのみ返すため、time 軸は常に 0 です。
-        // EN: Python now returns only the last step as [B, 1, V], so the valid time index is always 0.
-        let lastIndex = logits.shape[1].intValue - 1
-        let bestIDInt = argmaxLogitsRow(logits, batch: 0, time: lastIndex)
-        let bestID = Int32(bestIDInt)
 
-        generatedIDs.append(Int(bestID))
-        if bestID == eosTokenID {
-            return tokenizer.decode(tokens: generatedIDs)
-        }
-    }
-    
-    // (2) 증분 디코딩용 [1,1] 버퍼를 한 번만 생성하고 재사용
-    guard let stepInputArray = try? MLMultiArray(
-              shape: [NSNumber(value: batchSize), 1],
-              dataType: .int32
-          ),
-          let stepAttentionMask = try? MLMultiArray(
-              shape: [NSNumber(value: batchSize), 1],
-              dataType: .int32
-          ) else {
-        return ""
-    }
-    
-    // KR: 이후에는 마지막 토큰만 [1,1] 입력으로 넣어가며 한 토큰씩 greedy로 확장합니다.
-    // JP: 以降は最後のトークンだけを [1,1] 入力として与え、1 トークンずつ Greedy に生成を延長します。
-    // EN: After initialization, we only feed the last token as a [1,1] input and extend the sequence greedily one token at a time.
-    while generatedIDs.count < maxSeqLength {
-        guard let lastTokenInt = generatedIDs.last else {
-            break
-        }
-        
-        let lastTokenID = Int32(lastTokenInt)
-        if lastTokenID == eosTokenID {
-            break
-        }
-        
-        // 여기서는 할당 없이 값만 덮어쓰기
-        stepInputArray[0] = NSNumber(value: lastTokenID)
-        stepAttentionMask[0] = 1
-        
-        let input = zenz_v1_statefulInput(input_ids: stepInputArray, attention_mask: stepAttentionMask)
-        guard let output = try? model.prediction(input: input, using: state) else {
-            break
-        }
-        
         let logits = output.logits
-        let bestIDInt = argmaxLogitsRow(logits, batch: 0, time: 0)
-        let bestID = Int32(bestIDInt)
+        // stateful 모델은 보통 마지막 토큰에 대해서만 logits를 내보내서 time 차원이 1이다.
+        let lastTimeIndex = logits.shape[1].intValue - 1  // 보통 0
 
-        generatedIDs.append(Int(bestID))
-        if bestID == eosTokenID {
+        let nextTokenID = argmaxLogitsRow(logits, batch: 0, time: lastTimeIndex)
+        generationLog("[Stateful Greedy] step seqLen=\(seqLen), nextTokenID=\(nextTokenID), tokenText=\(tokenizer.decode(tokens: [nextTokenID]))")
+
+        if Int32(nextTokenID) == eosTokenID {
             break
         }
+
+        predictedTokenIDs.append(nextTokenID)
     }
-    
-    let predictedText = tokenizer.decode(tokens: generatedIDs)
-    let cleanedText = predictedText.replacingOccurrences(of: "[PAD]", with: "")
-    return cleanedText
+
+    let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
+    return predictedText.replacingOccurrences(of: "[PAD]", with: "")
 }
 
-// Greedy search를 사용하여 예측 수행
-// Perform prediction using Greedy search
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
+@available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)
+func greedyPredictStatefulAsync(text: String, model: zenz_v1_stateful, tokenizer: Tokenizer) async -> String {
+    let state = model.makeState()
+    var predictedTokenIDs = tokenizer.encode(text: text)
+    generationLog("[Stateful Greedy] inputIDs: \(text) \(predictedTokenIDs)")
+
+    let batchSize = 1
+    let maxSeqLength = 128
+    let eosTokenID: Int32 = 3
+
+    while predictedTokenIDs.count < maxSeqLength {
+        let seqLen = predictedTokenIDs.count
+
+        guard
+            let inputArray = try? MLMultiArray(
+                shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
+                dataType: .int32
+            ),
+            let attentionMask = try? MLMultiArray(
+                shape: [NSNumber(value: batchSize), NSNumber(value: seqLen)],
+                dataType: .int32
+            )
+        else {
+            print("[Stateful Greedy] Failed to allocate MLMultiArray")
+            break
+        }
+
+        for (index, token) in predictedTokenIDs.enumerated() {
+            inputArray[index] = NSNumber(value: token)
+            attentionMask[index] = 1
+        }
+
+        let input = zenz_v1_statefulInput(input_ids: inputArray, attention_mask: attentionMask)
+        guard let output = try? await model.prediction(input: input, using: state) else {
+            print("[Stateful Greedy] Prediction failed")
+            break
+        }
+
+        let logits = output.logits
+        let lastTimeIndex = logits.shape[1].intValue - 1
+
+        let nextTokenID = argmaxLogitsRow(logits, batch: 0, time: lastTimeIndex)
+        generationLog("[Stateful Greedy] step seqLen=\(seqLen), nextTokenID=\(nextTokenID), tokenText=\(tokenizer.decode(tokens: [nextTokenID]))")
+
+        if Int32(nextTokenID) == eosTokenID {
+            break
+        }
+
+        predictedTokenIDs.append(nextTokenID)
+    }
+
+    let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
+    return predictedText.replacingOccurrences(of: "[PAD]", with: "")
+}
+
+// Perform prediction using Greedy search.
+// Greedy search를 사용하여 예측을 수행합니다.
+// Greedyサーチを使って予測を行います。
 func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> String {
-    // 텍스트를 토크나이저를 사용하여 인코딩
-    // Encode the input text using the tokenizer
+    // Encode the input text using the tokenizer.
+    // 텍스트를 토크나이저를 사용하여 인코딩합니다.
+    // トークナイザーを使って入力テキストをエンコードします。
     var inputIDs = tokenizer.encode(text: text)
-    print("[Stateless Greedy][Sync] inputIDs:", text, inputIDs)
+    generationLog("[Stateless Greedy][Sync] inputIDs: \(text) \(inputIDs)")
     
-    // 최대 시퀀스 길이 설정
-    // Set the maximum sequence length
+    // Set the maximum sequence length.
+    // 최대 시퀀스 길이를 설정합니다.
+    // 最大シーケンス長を設定します。
     let maxSeqLength = 128
     let batchSize = 1
     
-    // 예측된 토큰 ID를 저장할 배열
-    // Array to store predicted token IDs
+    // Array to store predicted token IDs.
+    // 예측된 토큰 ID를 저장할 배열입니다.
+    // 予測されたトークンIDを保存する配列です。
     var predictedTokenIDs = inputIDs
     
     while true {
-        // 입력을 위한 MLMultiArray 생성
-        // Create MLMultiArray for input
+        // Create MLMultiArray for input.
+        // 입력을 위한 MLMultiArray를 생성합니다.
+        // 入力用のMLMultiArrayを作成します。
         let inputArray = try? MLMultiArray(shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)], dataType: .int32)
         for (index, token) in predictedTokenIDs.enumerated() {
             inputArray?[index] = NSNumber(value: token)
@@ -399,73 +492,87 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> String
         
         guard let inputArray else { return "" }
         
-        // 모델 입력 생성 (attention_mask 없이 input_ids만 전달)
-        // Create model input (only input_ids, no attention_mask)
+        // Create model input (only input_ids, no attention_mask).
+        // 모델 입력을 생성합니다 (attention_mask 없이 input_ids만 전달).
+        // モデル入力を作成します（attention_maskなしでinput_idsのみ渡します）。
         let input = zenz_v1Input(input_ids: inputArray)
         
-        // 예측 수행
-        // Perform prediction
+        // Perform prediction.
+        // 예측을 수행합니다.
+        // 予測を行います。
         guard let output = try? model.prediction(input: input) else { return "" }
         
-        // 출력 logits 디코딩
-        // Decode the output logits
+        // Decode the output logits.
+        // 출력 logits을 디코딩합니다.
+        // 出力logitsをデコードします。
         let logits = output.logits
         
-        // logits에서 예측된 토큰 ID 추출
-        // Extract predicted token ID from logits
+        // Extract predicted token ID from logits.
+        // logits에서 예측된 토큰 ID를 추출합니다.
+        // logitsから予測されたトークンIDを抽出します。
         let nextTokenID = argmaxLogitsRow(
             logits,
             batch: 0,
             time: predictedTokenIDs.count - 1
         )
         
-        // 종료 토큰 체크 (예: <EOS> 토큰 ID)
-        // Check for end token (e.g., <EOS> token ID)
+        // Check for end token (e.g., <EOS> token ID).
+        // 종료 토큰(예: <EOS> 토큰 ID)을 확인합니다.
+        // 終了トークン（例：<EOS>トークンID）を確認します。
         if nextTokenID == 3 {
             break
         }
         
-        // 예측된 토큰 ID를 추가
-        // Add the predicted token ID
+        // Add the predicted token ID.
+        // 예측된 토큰 ID를 추가합니다.
+        // 予測されたトークンIDを追加します。
         predictedTokenIDs.append(nextTokenID)
         
-        // 최대 시퀀스 길이에 도달하면 종료
-        // Exit if the maximum sequence length is reached
+        // Exit if the maximum sequence length is reached.
+        // 최대 시퀀스 길이에 도달하면 종료합니다.
+        // 最大シーケンス長に到達したら終了します。
         if predictedTokenIDs.count >= maxSeqLength {
             break
         }
     }
     
-    // 예측된 토큰 ID를 다시 텍스트로 디코딩
-    // Decode the predicted token IDs back to text
+    // Decode the predicted token IDs back to text.
+    // 예측된 토큰 ID를 다시 텍스트로 디코딩합니다.
+    // 予測されたトークンIDをテキストにデコードします。
     let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
     
-    // 결과 출력
-    // Print the result
+    // Print the result.
+    // 결과를 출력합니다.
+    // 結果を出力します。
     return predictedText
 }
 
-// Greedy search를 사용하여 예측 수행
-// Perform prediction using Greedy search
+// Perform prediction using Greedy search.
+// Greedy search를 사용하여 예측을 수행합니다.
+// Greedyサーチを使って予測を行います。
 @available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *)
 func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> String {
-    // 텍스트를 토크나이저를 사용하여 인코딩
-    // Encode the input text using the tokenizer
+    // Encode the input text using the tokenizer.
+    // 텍스트를 토크나이저를 사용하여 인코딩합니다.
+    // トークナイザーを使って入力テキストをエンコードします。
     var inputIDs = tokenizer.encode(text: text)
-    print("[Stateless Greedy][Async] inputIDs:", text, inputIDs)
+    generationLog("[Stateless Greedy][Async] inputIDs: \(text) \(inputIDs)")
     
-    // 최대 시퀀스 길이 설정
-    // Set the maximum sequence length
+    // Set the maximum sequence length.
+    // 최대 시퀀스 길이를 설정합니다.
+    // 最大シーケンス長を設定します。
     let maxSeqLength = 128
     let batchSize = 1
     
-    // 예측된 토큰 ID를 저장할 배열
-    // Array to store predicted token IDs
+    // Array to store predicted token IDs.
+    // 예측된 토큰 ID를 저장할 배열입니다.
+    // 予測されたトークンIDを保存する配列です。
     var predictedTokenIDs = inputIDs
     
     while true {
-        // 입력을 위한 MLMultiArray 생성
-        // Create MLMultiArray for input
+        // Create MLMultiArray for input.
+        // 입력을 위한 MLMultiArray를 생성합니다.
+        // 入力用のMLMultiArrayを作成します。
         let inputArray = try? MLMultiArray(shape: [NSNumber(value: batchSize), NSNumber(value: predictedTokenIDs.count)], dataType: .int32)
         for (index, token) in predictedTokenIDs.enumerated() {
             inputArray?[index] = NSNumber(value: token)
@@ -473,49 +580,58 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> 
         
         guard let inputArray else { return "" }
         
-        // 모델 입력 생성 (attention_mask 없이 input_ids만 전달)
-        // Create model input (only input_ids, no attention_mask)
+        // Create model input (only input_ids, no attention_mask).
+        // 모델 입력을 생성합니다 (attention_mask 없이 input_ids만 전달).
+        // モデル入力を作成します（attention_maskなしでinput_idsのみ渡します）。
         let input = zenz_v1Input(input_ids: inputArray)
         
-        // 예측 수행
-        // Perform prediction
+        // Perform prediction.
+        // 예측을 수행합니다.
+        // 予測を行います。
         guard let output = try? await model.prediction(input: input) else { return "" }
         
-        // 출력 logits 디코딩
-        // Decode the output logits
+        // Decode the output logits.
+        // 출력 logits을 디코딩합니다.
+        // 出力logitsをデコードします。
         let logits = output.logits
         
-        // logits에서 예측된 토큰 ID 추출
-        // Extract predicted token ID from logits
+        // Extract predicted token ID from logits.
+        // logits에서 예측된 토큰 ID를 추출합니다.
+        // logitsから予測されたトークンIDを抽出します。
         let nextTokenID = argmaxLogitsRow(
             logits,
             batch: 0,
             time: predictedTokenIDs.count - 1
         )
         
-        // 종료 토큰 체크 (예: <EOS> 토큰 ID)
-        // Check for end token (e.g., <EOS> token ID)
+        // Check for end token (e.g., <EOS> token ID).
+        // 종료 토큰(예: <EOS> 토큰 ID)을 확인합니다.
+        // 終了トークン（例：<EOS>トークンID）を確認します。
         if nextTokenID == 3 {
             break
         }
         
-        // 예측된 토큰 ID를 추가
-        // Add the predicted token ID
+        // Add the predicted token ID.
+        // 예측된 토큰 ID를 추가합니다.
+        // 予測されたトークンIDを追加します。
         predictedTokenIDs.append(nextTokenID)
         
-        // 최대 시퀀스 길이에 도달하면 종료
-        // Exit if the maximum sequence length is reached
+        // Exit if the maximum sequence length is reached.
+        // 최대 시퀀스 길이에 도달하면 종료합니다.
+        // 最大シーケンス長に到達したら終了します。
         if predictedTokenIDs.count >= maxSeqLength {
             break
         }
     }
     
-    // 예측된 토큰 ID를 다시 텍스트로 디코딩
-    // Decode the predicted token IDs back to text
+    // Decode the predicted token IDs back to text.
+    // 예측된 토큰 ID를 다시 텍스트로 디코딩합니다.
+    // 予測されたトークンIDをテキストにデコードします。
     let predictedText = tokenizer.decode(tokens: predictedTokenIDs)
     
-    // 결과 출력
-    // Print the result
+    // Print the result.
+    // 결과를 출력합니다.
+    // 結果を出力します。
     return predictedText
 }
 
@@ -524,124 +640,164 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> 
 @available(tvOS, deprecated: 16.0, message: "Use newer API greedyPredict(text:model:tokenizer) async")
 @available(watchOS, deprecated: 9.0, message: "Use newer API greedyPredict(text:model:tokenizer) async")
 func greedyPredictDispatch(text: String, model: zenz_v1, tokenizer: Tokenizer, qos: DispatchQoS) async -> String {
+    // Avoid capturing non-Sendable CoreML model/tokenizer directly in the @Sendable continuation
+    let modelPtr = Unmanaged.passUnretained(model).toOpaque()
+
+    let tokenizerObject = tokenizer as AnyObject
+    let tokenizerPtr = Unmanaged.passUnretained(tokenizerObject).toOpaque()
+
     return await withCheckedContinuation { continuation in
         DispatchQueue.global(qos: qos.qosClass).async {
+            let model = Unmanaged<zenz_v1>.fromOpaque(modelPtr).takeUnretainedValue()
+            let tokenizerObject = Unmanaged<AnyObject>.fromOpaque(tokenizerPtr).takeUnretainedValue()
+            guard let tokenizer = tokenizerObject as? Tokenizer else {
+                fatalError("Stored tokenizer does not conform to Tokenizer")
+            }
+
             let result = greedyPredict(text: text, model: model, tokenizer: tokenizer)
             continuation.resume(returning: result)
         }
     }
 }
 
-func main() async {
-    var benchmarks: [BenchmarkResult] = []
+// Shared benchmark environment (model + tokenizer) initialized once and reused.
+// 벤치마크 공통 환경 (모델 + 토크나이저)을 한 번만 초기화해서 재사용하기 위한 구조체.
+// ベンチマーク共通の環境（モデル + トークナイザー）を一度だけ初期化して再利用するための構造体。
+struct BenchmarkEnvironment {
+    let model: zenz_v1
+    let tokenizer: Tokenizer
+}
+
+// Load the model and tokenizer and build a BenchmarkEnvironment.
+// 모델과 토크나이저를 로드하여 BenchmarkEnvironment를 구성합니다.
+// モデルとトークナイザーを読み込んで BenchmarkEnvironment を構築します。
+func makeBenchmarkEnvironment() async -> BenchmarkEnvironment {
     let model = loadModel()
     guard let model else { fatalError("model not found") }
+    
     let tokenizer = await loadTokenizer()
     guard let tokenizer else { fatalError("tokenizer not found") }
-    do {
-        // ニホンゴ（Japanese in Katakana Form）→日本語（Japanese in Kanji form）
-        if #available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *) {
-            let startAsync = Date()
-            let predictedSentenceAsync = await greedyPredict(text: "\u{EE00}ニホンゴ\u{EE01}", model: model, tokenizer: tokenizer)
-            print("[Stateless Greedy][Async global][ニホンゴ] output:", predictedSentenceAsync)
-            let durationAsync = Date().timeIntervalSince(startAsync)
-            print("[Stateless Greedy][Async global][ニホンゴ] duration (s):", durationAsync)
-            benchmarks.append(BenchmarkResult(label: "[Stateless Greedy][Async global][ニホンゴ]", duration: durationAsync))
-        } else {
-            let startAsync = Date()
-            let predictedSentenceAsync = await greedyPredictDispatch(text: "\u{EE00}ニホンゴ\u{EE01}", model: model, tokenizer: tokenizer, qos: .userInitiated)
-            print("[Stateless Greedy][Async dispatch][ニホンゴ] output:", predictedSentenceAsync)
-            let durationAsync = Date().timeIntervalSince(startAsync)
-            print("[Stateless Greedy][Async dispatch][ニホンゴ] duration (s):", durationAsync)
-            benchmarks.append(BenchmarkResult(label: "[Stateless Greedy][Async dispatch][ニホンゴ]", duration: durationAsync))
-        }
-        
-        let start = Date()
-        let predictedSentence = greedyPredict(text: "\u{EE00}ニホンゴ\u{EE01}", model: model, tokenizer: tokenizer)
-        print("[Stateless Greedy][Sync main][ニホンゴ] output:", predictedSentence)
-        let durationSync = Date().timeIntervalSince(start)
-        print("[Stateless Greedy][Sync main][ニホンゴ] duration (s):", durationSync)
-        benchmarks.append(BenchmarkResult(label: "[Stateless Greedy][Sync main][ニホンゴ]", duration: durationSync))
-    }
-    do {
-        // カンコクゴヲベンキョウスル（'Study Korean' in Katakana Form）→韓国語を勉強する（'Study Korean' in Kanji form）
-        if #available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *) {
-            let startAsync = Date()
-            let predictedSentenceAsnyc = await greedyPredict(text: "\u{EE00}カンコクゴヲベンキョウスル\u{EE01}", model: model, tokenizer: tokenizer)
-            print("[Stateless Greedy][Async global][カンコクゴ] output:", predictedSentenceAsnyc)
-            let durationAsync = Date().timeIntervalSince(startAsync)
-            print("[Stateless Greedy][Async global][カンコクゴ] duration (s):", durationAsync)
-            benchmarks.append(BenchmarkResult(label: "[Stateless Greedy][Async global][カンコクゴ]", duration: durationAsync))
-        } else {
-            let startAsync = Date()
-            let predictedSentenceAsync = await greedyPredictDispatch(text: "\u{EE00}カンコクゴヲベンキョウスル\u{EE01}", model: model, tokenizer: tokenizer, qos: .userInitiated)
-            print("[Stateless Greedy][Async dispatch][カンコクゴ] output:", predictedSentenceAsync)
-            let durationAsync = Date().timeIntervalSince(startAsync)
-            print("[Stateless Greedy][Async dispatch][カンコクゴ] duration (s):", durationAsync)
-            benchmarks.append(BenchmarkResult(label: "[Stateless Greedy][Async dispatch][カンコクゴ]", duration: durationAsync))
-        }
-        
-        let start = Date()
-        let predictedSentence = greedyPredict(text: "\u{EE00}カンコクゴヲベンキョウスル\u{EE01}", model: model, tokenizer: tokenizer)
-        print("[Stateless Greedy][Sync main][カンコクゴ] output:", predictedSentence)
-        let durationSync = Date().timeIntervalSince(start)
-        print("[Stateless Greedy][Sync main][カンコクゴ] duration (s):", durationSync)
-        benchmarks.append(BenchmarkResult(label: "[Stateless Greedy][Sync main][カンコクゴ]", duration: durationSync))
+    
+    return BenchmarkEnvironment(model: model, tokenizer: tokenizer)
+}
+
+// For the given sentence (kana input), run both stateless and stateful benchmarks and print grouped rankings.
+// 주어진 문장(카타카나 입력)에 대해 Stateless / Stateful 양쪽 벤치마크를 실행하고, 그룹별 랭킹을 출력합니다.
+// 与えられた文（カタカナ入力）に対して Stateless / Stateful の両方のベンチマークを実行し、グループ別ランキングを出力します。
+func runBenchmarksFor(groupTag: String, kanaInput: String, env: BenchmarkEnvironment) async {
+    var benchmarks: [BenchmarkResult] = []
+    let model = env.model
+    let tokenizer = env.tokenizer
+    
+    // MARK: - Stateless (Async)
+    if #available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *) {
+        let startAsync = Date()
+        let predictedSentenceAsync = await greedyPredict(text: kanaInput, model: model, tokenizer: tokenizer)
+        let durationAsync = Date().timeIntervalSince(startAsync)
+        benchmarks.append(
+            BenchmarkResult(
+                label: "[Stateless Greedy][Async global]\(groupTag)",
+                duration: durationAsync,
+                input: kanaInput,
+                output: predictedSentenceAsync
+            )
+        )
+    } else {
+        let startAsync = Date()
+        let predictedSentenceAsync = await greedyPredictDispatch(text: kanaInput, model: model, tokenizer: tokenizer, qos: .userInitiated)
+        let durationAsync = Date().timeIntervalSince(startAsync)
+        benchmarks.append(
+            BenchmarkResult(
+                label: "[Stateless Greedy][Async dispatch]\(groupTag)",
+                duration: durationAsync,
+                input: kanaInput,
+                output: predictedSentenceAsync
+            )
+        )
     }
     
+    // MARK: - Stateless (Sync)
+    do {
+        let start = Date()
+        let predictedSentence = greedyPredict(text: kanaInput, model: model, tokenizer: tokenizer)
+        let durationSync = Date().timeIntervalSince(start)
+        benchmarks.append(
+            BenchmarkResult(
+                label: "[Stateless Greedy][Sync main]\(groupTag)",
+                duration: durationSync,
+                input: kanaInput,
+                output: predictedSentence
+            )
+        )
+    }
+    
+    // MARK: - Stateful (Async & Sync)
     if #available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *) {
         let statefulModel = loadStatefulModel()
-        
-        guard let statefulModel else { fatalError("Stateful model not found") }
-        do {
-            // KR: Stateful 모델을 벤치마크 전에 한 번만 실행해서,
-            //     컴파일/플랜 빌드 시간을 측정에서 제외합니다.
-            // JP: ステートフルモデルをベンチマーク前に一度だけ実行し、
-            //     コンパイル/プラン構築時間を測定から除外します。
-            // EN: Run the stateful model once before benchmarking so that
-            //     compile/plan-build time is excluded from the timing.
-
-            if
-                let warmupInputIDs = try? MLMultiArray(shape: [1, 1], dataType: .int32),
-                let warmupMask = try? MLMultiArray(shape: [1, 1], dataType: .int32)
-            {
-                warmupInputIDs[0] = 0
-                warmupMask[0] = 1
-
-                let warmupInput = zenz_v1_statefulInput(
-                    input_ids: warmupInputIDs,
-                    attention_mask: warmupMask
-                )
-
-                // 이 prediction은 async 버전으로 잡혀 있어서 await 필요
-                _ = try? await statefulModel.prediction(
-                    input: warmupInput,
-                    using: statefulModel.makeState()
-                )
-            } else {
-                print("[Stateful Warmup] Skipped: failed to allocate MLMultiArray.")
-            }
+        guard let statefulModel else {
+            print("[Stateful Greedy]\(groupTag) Skipped: stateful model not found")
+            printBenchmarkRanking(for: groupTag, benchmarks: benchmarks)
+            return
         }
         
+        // Run the stateful model once before benchmarking so that compile/plan-build time is excluded.
+        // Stateful 모델을 벤치마크 전에 한 번만 실행해서, 컴파일/플랜 빌드 시간을 측정에서 제외합니다.
+        // ステートフルモデルをベンチマーク前に一度だけ実行し、コンパイル/プラン構築時間を測定から除外します。
+        if
+            let warmupInputIDs = try? MLMultiArray(shape: [1, 1], dataType: .int32),
+            let warmupMask = try? MLMultiArray(shape: [1, 1], dataType: .int32)
+        {
+            warmupInputIDs[0] = 0
+            warmupMask[0] = 1
+            
+            let warmupInput = zenz_v1_statefulInput(
+                input_ids: warmupInputIDs,
+                attention_mask: warmupMask
+            )
+            
+            _ = try? await statefulModel.prediction(
+                input: warmupInput,
+                using: statefulModel.makeState()
+            )
+        } else {
+            print("[Stateful Warmup]\(groupTag) Skipped: failed to allocate MLMultiArray.")
+        }
+        
+        // Stateful Async
+        do {
+            let startAsync = Date()
+            let predictedSentenceAsync = await greedyPredictStatefulAsync(text: kanaInput, model: statefulModel, tokenizer: tokenizer)
+            let durationAsync = Date().timeIntervalSince(startAsync)
+            benchmarks.append(
+                BenchmarkResult(
+                    label: "[Stateful Greedy][Async global]\(groupTag)",
+                    duration: durationAsync,
+                    input: kanaInput,
+                    output: predictedSentenceAsync
+                )
+            )
+        }
+        
+        // Stateful Sync
         do {
             let start = Date()
-            let predictedSentence = greedyPredictStateful(text: "\u{EE00}ニホンゴ\u{EE01}", model: statefulModel, tokenizer: tokenizer)
-            print("[Stateful Greedy][Sync main][ニホンゴ] output:", predictedSentence)
+            let predictedSentence = greedyPredictStateful(text: kanaInput, model: statefulModel, tokenizer: tokenizer)
             let durationStateful = Date().timeIntervalSince(start)
-            print("[Stateful Greedy][Sync main][ニホンゴ] duration (s):", durationStateful)
-            benchmarks.append(BenchmarkResult(label: "[Stateful Greedy][Sync main][ニホンゴ]", duration: durationStateful))
+            benchmarks.append(
+                BenchmarkResult(
+                    label: "[Stateful Greedy][Sync main]\(groupTag)",
+                    duration: durationStateful,
+                    input: kanaInput,
+                    output: predictedSentence
+                )
+            )
         }
-        do {
-            let start = Date()
-            let predictedSentence = greedyPredictStateful(text: "\u{EE00}カンコクゴヲベンキョウスル\u{EE01}", model: statefulModel, tokenizer: tokenizer)
-            print("[Stateful Greedy][Sync main][カンコクゴ] output:", predictedSentence)
-            let durationStateful = Date().timeIntervalSince(start)
-            print("[Stateful Greedy][Sync main][カンコクゴ] duration (s):", durationStateful)
-            benchmarks.append(BenchmarkResult(label: "[Stateful Greedy][Sync main][カンコクゴ]", duration: durationStateful))
-        }
+    } else {
+        print("[Stateful Greedy]\(groupTag) Skipped: stateful model not available on this OS.")
     }
-    print("===== Benchmark Ranking (fast → slow) =====")
-    for (index, result) in benchmarks.sorted(by: { $0.duration < $1.duration }).enumerated() {
-        print("\(index + 1). \(result.label): \(result.duration) s")
-    }
+    
+    // Print benchmark ranking for this group (sentence).
+    // 이 그룹(문장)에 대한 벤치마크 랭킹을 출력합니다.
+    // このグループ（文）に対するベンチマークランキングを出力します。
+    printBenchmarkRanking(for: groupTag, benchmarks: benchmarks)
 }
