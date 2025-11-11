@@ -22,6 +22,8 @@ xcodebuild -scheme swift-zenz-coreml -destination "platform=macOS,name=Any Mac" 
 
 ## 1回目＋2回目の統合平均 / 1회차 + 2회차 통합 평균 / Combined Average (Round 1 + 2)
 
+Tested on MacBook Pro (14-inch, 2023) with Apple M3 Pro chip.
+
 | Strategy | Avg latency (s) |
 |----------|----------------:|
 | Stateful / Async global | 0.169 |
