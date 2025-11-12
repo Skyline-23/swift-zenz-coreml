@@ -50,5 +50,5 @@ Tested on MacBook Pro (14-inch, 2023) with Apple M3 Pro chip.
 | Stateless / Sync main | 0.240 |
 
 Detailed benchmark results for Round 1 and Round 2 are available here:  
-[Round 1 details](docs/benchmarks/round1.md)  
-[Round 2 details](docs/benchmarks/round2.md)
+[Round 1 details](benchmarks/round1.md)  
+[Round 2 details](benchmarks/round2.md)
