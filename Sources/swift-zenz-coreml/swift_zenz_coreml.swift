@@ -551,7 +551,7 @@ func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) -> String
 // Greedy search를 사용하여 예측을 수행합니다.
 // Greedyサーチを使って予測を行います。
 @available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *)
-func greedyPredict(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> String {
+func greedyPredictAsync(text: String, model: zenz_v1, tokenizer: Tokenizer) async -> String {
     // Encode the input text using the tokenizer.
     // 텍스트를 토크나이저를 사용하여 인코딩합니다.
     // トークナイザーを使って入力テキストをエンコードします。
@@ -692,7 +692,7 @@ func runBenchmarksFor(groupTag: String, kanaInput: String, env: BenchmarkEnviron
     // MARK: - Stateless (Async)
     if #available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *) {
         let startAsync = Date()
-        let predictedSentenceAsync = await greedyPredict(text: kanaInput, model: model, tokenizer: tokenizer)
+        let predictedSentenceAsync = await greedyPredictAsync(text: kanaInput, model: model, tokenizer: tokenizer)
         let durationAsync = Date().timeIntervalSince(startAsync)
         benchmarks.append(
             BenchmarkResult(
